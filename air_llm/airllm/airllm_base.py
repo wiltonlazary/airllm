@@ -6,19 +6,19 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, AutoModel, GenerationMixin, LlamaForCausalLM, GenerationConfig
-from transformers.modeling_outputs import CausalLMOutputWithPast
+import transformers
+from transformers import AutoConfig, AutoTokenizer, GenerationConfig
+from transformers.generation import GenerationMixin
 from accelerate import init_empty_weights
-
 from accelerate.utils.modeling import set_module_tensor_to_device
-from transformers.quantizers import AutoHfQuantizer, HfQuantizer
+from transformers.quantizers import AutoHfQuantizer
 
 from .profiler import LayeredProfiler
 
-from optimum.bettertransformer import BetterTransformer
-
-from .utils import clean_memory, load_layer, \
-    find_or_create_local_splitted_path
+from .utils import clean_memory, load_layer, layer_tensor_names, load_layer_subset, \
+    find_or_create_local_splitted_path, load_merged_ngram_embedding, \
+    open_ngram_mmap_table, MmapEmbedding, _force_meta_embeddings
+from .persist import ModelPersister
 
 try:
     import bitsandbytes as bnb
@@ -29,39 +29,63 @@ except ImportError:
     bitsandbytes_installed = False
 
 
-
-try:
-    from transformers.cache_utils import Cache, DynamicCache
-
-    cache_utils_installed = True
-    print('>>>> cache_utils installed')
-except ImportError:
-    cache_utils_installed = False
-
+# Helpers that transformers 5.0 moved out of transformers.utils.generic. Remote model code is
+# routinely written against an older transformers and still imports them from the old location,
+# which makes such models fail to import at all. Re-exporting is enough to load them.
+_RELOCATED_TRANSFORMERS_SYMBOLS = {
+    'OutputRecorder': 'transformers.utils.output_capturing',
+    'check_model_inputs': 'transformers.utils.output_capturing',
+}
 
 
+def restore_relocated_transformers_symbols():
+    """Re-export moved transformers helpers under their old names, where they are missing."""
+    import importlib
+    import transformers.utils.generic as generic
+
+    for name, new_home in _RELOCATED_TRANSFORMERS_SYMBOLS.items():
+        if hasattr(generic, name):
+            continue
+        try:
+            module = importlib.import_module(new_home)
+        except ImportError:
+            continue
+        symbol = getattr(module, name, None)
+        if symbol is not None:
+            setattr(generic, name, symbol)
 
 
+class AirLLMBaseModel:
+    """
+    Memory-frugal wrapper around a Hugging Face ``*ForCausalLM`` model.
 
-class AirLLMBaseModel(GenerationMixin):
+    The checkpoint is split into per-layer shards on disk. The real transformers model is
+    instantiated on the ``meta`` device (no memory used) and owns the full forward / generation
+    logic. AirLLM only attaches forward hooks to each big module (embeddings, every decoder
+    layer, the final norm and the lm_head) to stream that module's weights disk -> GPU right
+    before it runs and free them right after, prefetching the next module on a worker thread.
 
-    # customize layer names here
+    Because transformers drives the forward pass, AirLLM no longer needs to track per-architecture
+    attention/rotary/cache details: new model architectures work as soon as transformers supports
+    them.
+    """
+
+    # Upper bound on how much pinned (page-locked) host memory a single prefetched layer may use.
+    # Layers larger than this are loaded into ordinary pageable memory instead.
+    max_pinned_layer_bytes = 2 * 1024 ** 3
+
+    # Subclasses override this to point at non-standard module names.
     def set_layer_names_dict(self):
         self.layer_names_dict = {'embed': 'model.embed_tokens',
-                       'layer_prefix': 'model.layers',
-                       'norm': 'model.norm',
-                       'lm_head': 'lm_head',}
+                                 'layer_prefix': 'model.layers',
+                                 'norm': 'model.norm',
+                                 'lm_head': 'lm_head'}
 
-
-
-    def __init__(self, model_local_path_or_repo_id, device="cuda:0", dtype=torch.float16, max_seq_len=512,
+    def __init__(self, model_local_path_or_repo_id, device="cuda:0", dtype=None, max_seq_len=512,
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
-                 hf_token=None, prefetching=True, delete_original=False):
+                 hf_token=None, prefetching=True, delete_original=False,
+                 install_hooks=True, load_resident=True):
         """
-        Sharded version of LlamaForCausalLM : the model is splitted into layer shards to reduce GPU memory usage.
-        During the forward pass, the inputs are processed layer by layer, and the GPU memory is freed after each layer.
-        To avoid loading the layers multiple times, we could save all the intermediate activations in RAM.
-
         Parameters
         ----------
         model_local_path_or_repo_id : str or Path
@@ -69,19 +93,31 @@ class AirLLMBaseModel(GenerationMixin):
         device : str, optional
             device, by default "cuda:0"
         dtype : torch.dtype, optional
-            dtype, by default torch.float16
+            runtime dtype; defaults to the model's own config.torch_dtype (usually bfloat16 for
+            modern models). float16 has too narrow a range for very deep models and overflows to
+            inf/NaN, which silently corrupts the output, so we don't force it.
         max_seq_len : int, optional
-            max seq lenght, by default 512
+            max seq length, by default 512
         layer_shards_saving_path : str, optional
-            optional path to save layered shards model file, by default just save to the local cache of model, subdir named splitted_model will be saved
-        profiling_mode : book, optional
-            if to profile the model loading time, default to False
-        compression: str, optinal
-            setting to '4bit' or '8bit' to enable compression from 16 bits to 4 bits/8 bits which speeed up 4x or 2x inference time with a tiny accuracy loss.
+            optional path to save the splitted shards, by default next to the model cache
+        profiling_mode : bool, optional
+            whether to profile the model loading time, default False
+        compression: str, optional
+            '4bit' or '8bit' to enable block-wise quantization of the on-disk shards
         hf_token: str, optional
-            huggingface api token could be provided, by default None
+            huggingface api token
+        prefetching: bool, optional
+            overlap the next layer's disk load with the current layer's compute
+        delete_original: bool, optional
+            delete the original downloaded checkpoint after splitting to save disk space
+        install_hooks: bool, optional
+            attach inference streaming hooks. Training drives load/evict itself, so LoRA
+            training passes False — the hooks call ``module.to('meta')`` after forward and
+            that breaks backward.
+        load_resident: bool, optional
+            load ``resident`` modules (e.g. a vision tower) onto the GPU. Text-only LoRA
+            training leaves them on meta.
         """
-
 
         self.profiling_mode = profiling_mode
         self.profiler = LayeredProfiler()
@@ -89,156 +125,283 @@ class AirLLMBaseModel(GenerationMixin):
         self.total_disk_loading_time = None
         self.total_gpu_loading_time = None
         self.total_compression_overhead_time = None
-        self._supports_cache_class = False
         self.hf_quantizer = None
 
-        if compression is not None:
-            if not bitsandbytes_installed:
-                raise ImportError('WARNING: bitsandbytes not found. Compression needs bitsandbytes. To use compression, please install bitsandbytes: `pip install bitsandbytes`')
-
+        if compression is not None and not bitsandbytes_installed:
+            raise ImportError('WARNING: bitsandbytes not found. Compression needs bitsandbytes. '
+                              'To use compression, please install bitsandbytes: `pip install bitsandbytes`')
 
         self.compression = compression
         self.hf_token = hf_token
 
-        # Save parameters
+        restore_relocated_transformers_symbols()
 
         self.set_layer_names_dict()
 
+        self.model_local_path, self.checkpoint_path = find_or_create_local_splitted_path(
+            model_local_path_or_repo_id,
+            layer_shards_saving_path,
+            compression=compression,
+            layer_names=self.layer_names_dict,
+            hf_token=hf_token,
+            delete_original=delete_original)
 
-        self.model_local_path, self.checkpoint_path = find_or_create_local_splitted_path(model_local_path_or_repo_id,
-                                                                                         layer_shards_saving_path,
-                                                                                         compression=compression,
-                                                                                         layer_names=self.layer_names_dict,
-                                                                                         hf_token=hf_token,
-                                                                                         delete_original=delete_original)
         self.running_device = device
         self.device = torch.device(self.running_device)
+
+        # Prefer transformers' native implementation; only trust the model's bundled remote code when
+        # transformers doesn't recognize the architecture. Vendored remote code is frequently pinned
+        # to an old transformers and breaks against the current cache/generation APIs (e.g.
+        # DeepSeek-V2's modeling_deepseek.py calls the long-removed DynamicCache.seen_tokens).
+        token_kwargs = {'token': hf_token} if hf_token is not None else {}
+        try:
+            self.config = AutoConfig.from_pretrained(
+                self.model_local_path, trust_remote_code=False, **token_kwargs)
+            self.trust_remote_code = False
+        except Exception:
+            self.config = AutoConfig.from_pretrained(
+                self.model_local_path, trust_remote_code=True, **token_kwargs)
+            self.trust_remote_code = True
+
+        # Default to the model's native dtype (bf16 for most modern models). Forcing fp16 overflows
+        # on deep models (e.g. Qwen3-235B's 94 layers) and produces garbage; bf16's wider range
+        # avoids it. Users can still override via dtype=.
+        if dtype is None:
+            cfg_dtype = getattr(self.config, "torch_dtype", None)
+            if cfg_dtype is None:
+                cfg_dtype = getattr(self.config, "dtype", None)
+            if cfg_dtype is None:
+                text_cfg = getattr(self.config, "text_config", None)
+                cfg_dtype = getattr(text_cfg, "torch_dtype", None) or getattr(text_cfg, "dtype", None)
+            if isinstance(cfg_dtype, str):
+                cfg_dtype = getattr(torch, cfg_dtype, None)
+            dtype = cfg_dtype if isinstance(cfg_dtype, torch.dtype) else torch.float16
         self.running_dtype = dtype
         self.dtype = self.running_dtype
 
-        # Create model
-        if hf_token is not None:
-            self.config = AutoConfig.from_pretrained(self.model_local_path, token=hf_token, trust_remote_code=True)
-        else:
-            self.config = AutoConfig.from_pretrained(self.model_local_path, trust_remote_code=True)
-
         self.generation_config = self.get_generation_config()
-        #print(f"using generation_config: {self.generation_config}")
-
         self.tokenizer = self.get_tokenizer(hf_token=hf_token)
 
+        # prefetch executor / state
+        self.prefetching = prefetching
+        if self.compression is not None and self.prefetching:
+            print("prefetching is not supported together with compression for now; disabling prefetching.")
+            self.prefetching = False
+        self._executor = ThreadPoolExecutor(max_workers=1) if self.prefetching else None
+        self._prefetch_future = None
+        self._prefetched_idx = None
 
         self.init_model()
 
-        # get layer count:
+        # compute layer count from the instantiated model
         model_attr = self.model
         for attr_name in self.layer_names_dict["layer_prefix"].split("."):
             model_attr = getattr(model_attr, attr_name)
-
         layers_count = len(model_attr)
 
-
-        self.layer_names = [self.layer_names_dict['embed']] + [f'{self.layer_names_dict["layer_prefix"]}.{i}' for i in
-                                                               range(layers_count)] + \
+        self.layer_names = [self.layer_names_dict['embed']] + \
+                           [f'{self.layer_names_dict["layer_prefix"]}.{i}' for i in range(layers_count)] + \
                            [self.layer_names_dict['norm'], self.layer_names_dict['lm_head']]
 
         self.max_seq_len = max_seq_len
 
-        self.main_input_name = "input_ids"
+        self.set_layers_from_layer_names()
+        if load_resident:
+            self._load_resident_modules()
+        self._load_cpu_resident_modules()
+        if install_hooks:
+            self._install_streaming_hooks()
 
-        # model weights prefetch cuda stream
-        self.prefetching = prefetching
+    # ---- customization hooks for subclasses -------------------------------------------------
 
-        if self.compression is not None:
-            self.prefetching = False
-            print(f"not support prefetching for compression for now. loading with no prepetching mode.")
-
-        # this operation should run only if gpu is available
-        if prefetching and device.startswith("cuda"):
-            self.stream = torch.cuda.Stream()
-        else:
-            self.stream = None
-
-    # if derived class needs to create generation config differently, like Mistrial, this function can be overridden
     def get_generation_config(self):
-        # protective on generation config
-
         try:
             return GenerationConfig.from_pretrained(self.model_local_path)
-        except Exception as e:
+        except Exception:
             return GenerationConfig()
 
-    # a chance to customize tokenizer
     def get_tokenizer(self, hf_token=None):
         if hf_token is not None:
             return AutoTokenizer.from_pretrained(self.model_local_path, token=hf_token, trust_remote_code=True)
         else:
             return AutoTokenizer.from_pretrained(self.model_local_path, trust_remote_code=True)
 
-    def get_use_better_transformer(self):
-        return True
+    # ---- model construction -----------------------------------------------------------------
+
+    def _propagate_attn_implementation(self, impl):
+        """Push the attention choice down into nested sub-configs.
+
+        Multimodal wrappers keep the real decoder under a sub-config -- Kimi K3 uses ``text_config``
+        -- and transformers records the request only on the config it was handed. The sub-model then
+        reads an unset value and falls through to a flash-attention path, which fails outright on a
+        machine without flash-attn installed.
+        """
+        from transformers import PretrainedConfig
+
+        def walk(cfg, depth=0):
+            if depth > 2:
+                return
+            for sub in vars(cfg).values():
+                if isinstance(sub, PretrainedConfig):
+                    sub._attn_implementation = impl
+                    walk(sub, depth + 1)
+
+        walk(self.config)
+
+    def _model_matches_layer_names(self, model):
+        """True when the instantiated class actually has the modules we plan to stream.
+
+        Auto factories key off ``model_type``, so a VL checkpoint can land on a text-only or
+        backbone class whose tree doesn't match ``layer_names_dict``. Reject those and keep trying.
+        """
+        try:
+            for key in ('embed', 'layer_prefix', 'norm', 'lm_head'):
+                mod = model
+                for attr in self.layer_names_dict[key].split('.'):
+                    mod = getattr(mod, attr)
+            return True
+        except AttributeError:
+            return False
+
+    def _auto_model_classes(self):
+        """Auto* factories to try, in order, when building the empty model.
+
+        ``AutoModelForCausalLM`` maps some VL model_types (notably ``qwen3_5``) onto a text-only
+        ``*ForCausalLM`` class. That class expects a text config and either crashes or builds a
+        model whose module names don't match the checkpoint. Conditional-generation architectures
+        therefore try the image-text factories first.
+        """
+        archs = getattr(self.config, "architectures", None) or []
+        arch = archs[0] if archs else ""
+        names = []
+        if any(tag in arch for tag in ("ConditionalGeneration", "ImageTextToText", "Multimodal")):
+            names.extend(["AutoModelForImageTextToText", "AutoModelForMultimodalLM"])
+        names.extend([
+            "AutoModelForCausalLM",
+            "AutoModelForImageTextToText",
+            "AutoModelForMultimodalLM",
+            "AutoModel",
+        ])
+        seen = set()
+        classes = []
+        for name in names:
+            if name in seen:
+                continue
+            seen.add(name)
+            cls = getattr(transformers, name, None)
+            if cls is not None:
+                classes.append((name, cls))
+        return classes
+
+    def _instantiate_on_meta(self, attn_implementation):
+        """Build the transformers model on the meta device for one attention implementation."""
+        self._propagate_attn_implementation(attn_implementation)
+        kwargs = {
+            "attn_implementation": attn_implementation,
+            "trust_remote_code": self.trust_remote_code,
+        }
+        errors = []
+        with _force_meta_embeddings():
+            for name, cls in self._auto_model_classes():
+                try:
+                    with init_empty_weights(include_buffers=False):
+                        model = cls.from_config(self.config, **kwargs)
+                except TypeError:
+                    # Older Auto factories don't take attn_implementation.
+                    try:
+                        with init_empty_weights(include_buffers=False):
+                            model = cls.from_config(self.config, trust_remote_code=self.trust_remote_code)
+                    except Exception as e:  # noqa: BLE001 - try the next factory
+                        errors.append(f"{name}: {type(e).__name__}: {e}")
+                        continue
+                except Exception as e:  # noqa: BLE001 - try the next factory
+                    errors.append(f"{name}: {type(e).__name__}: {e}")
+                    continue
+                if not self._model_matches_layer_names(model):
+                    errors.append(
+                        f"{name}: built {type(model).__name__} but it is missing "
+                        f"{self.layer_names_dict['layer_prefix']}"
+                    )
+                    continue
+                print(f"built empty {type(model).__name__} via {name} (attn={attn_implementation})")
+                return model
+        raise RuntimeError(
+            "Could not instantiate the model on meta from config. "
+            f"architecture={getattr(self.config, 'architectures', None)} "
+            f"model_type={getattr(self.config, 'model_type', None)}. "
+            f"Tried: {'; '.join(errors)}"
+        )
 
     def init_model(self):
-
-        # try way 1 better transformers...
-        # Load meta model (no memory used)
-        self.model = None
-
-        if self.get_use_better_transformer():
-            try:
-                with init_empty_weights():
-                    self.model = AutoModelForCausalLM.from_config(self.config, trust_remote_code=True)
-                    self.model = BetterTransformer.transform(self.model)  # enable flash attention
-            except ValueError as ve:
-                del self.model
-                clean_memory()
-                self.model = None
-
-            if self.model is None:
-                # try way 2.
-                try:
-
-                    print(f"new version of transfomer, no need to use BetterTransformer, try setting attn impl to sdpa...")
-                    self.config.attn_implementation = "sdpa"
-
-                    with init_empty_weights():
-                        self.model = AutoModelForCausalLM.from_config(self.config, attn_implementation="sdpa", trust_remote_code=True)
-                    print(f"attn imp: {type(self.model.model.layers[3].self_attn)}")
-
-                except TypeError as ve:
-                    del self.model
-                    clean_memory()
-                    self.model = None
-
-        # fallback to original way
-        if self.model is None:
-            print(f"either BetterTransformer or attn_implementation='sdpa' is available, creating model directly")
-            with init_empty_weights():
-                self.model = AutoModelForCausalLM.from_config(self.config, trust_remote_code=True)
+        # Build the real model on meta (no memory). include_buffers=False so non-persistent
+        # buffers such as rotary inv_freq are actually computed (they aren't in the checkpoint).
+        try:
+            self.model = self._instantiate_on_meta("sdpa")
+        except Exception as e:
+            print(f"attn_implementation='sdpa' not available ({e}), falling back to eager attention")
+            # Some (often remote-code) architectures don't support sdpa and also default to it, so we
+            # must request eager explicitly; otherwise transformers re-selects sdpa and errors again.
+            self.model = self._instantiate_on_meta("eager")
 
         quantization_config = getattr(self.config, "quantization_config", None)
-
+        if quantization_config is None:
+            # Nested multimodal configs (Kimi K3) keep it under text_config.
+            quantization_config = getattr(getattr(self.config, "text_config", None),
+                                          "quantization_config", None)
         if quantization_config is not None:
             self.hf_quantizer = AutoHfQuantizer.from_config(quantization_config, pre_quantized=True)
             device_map = self.hf_quantizer.update_device_map(None)
-            self.hf_quantizer.preprocess_model(model = self.model, device_map = device_map)
+            self.hf_quantizer.preprocess_model(model=self.model, device_map=device_map)
+            # compressed-tensors registers a hook that expands every packed module on the first
+            # forward. That undoes per-expert streaming (a K3 layer becomes ~56GB) and is also
+            # unnecessary: we decompress each expert ourselves as it loads. Remove the hook.
+            hook = getattr(self.model, "ct_decompress_hook", None)
+            if hook is not None:
+                hook.remove()
+                delattr(self.model, "ct_decompress_hook")
 
         self.model.eval()
         self.model.tie_weights()
+        self.model.generation_config = self.generation_config
 
-        self.set_layers_from_layer_names()
-
-        # Move buffers to device (not that much GPU memory used)
+        # Move all (already-materialized) buffers to the running device, preserving their dtype.
+        # This includes rotary inv_freq, which transformers computes once at the model level and
+        # passes down to every decoder layer.
         for buffer_name, buffer in self.model.named_buffers():
-            set_module_tensor_to_device(self.model, buffer_name, self.running_device, value=buffer,
-                                        dtype=self.running_dtype)
+            if buffer is not None and buffer.device.type != 'meta':
+                set_module_tensor_to_device(self.model, buffer_name, self.running_device, value=buffer)
 
-        if 'rotary_pos_emb' in self.layer_names_dict:
-            # for glm keep rotary_pos_emb in gpu
-            self.load_rotary_pos_emb_to_device()
+        # Force the model to report the running (cuda) device even though its parameters live on
+        # meta between layer executions, so transformers' generation utilities place inputs/cache
+        # tensors on the right device.
+        self._patch_device_property()
+
+    def _patch_device_property(self):
+        running_device = torch.device(self.running_device)
+        running_dtype = self.running_dtype
+        base_cls = type(self.model)
+
+        # transformers >= 4.50 removed GenerationMixin from PreTrainedModel, so model classes that
+        # predate that change (or ship as remote code, like Kimi K3's multimodal wrapper) no longer
+        # have .generate(). They still define prepare_inputs_for_generation, so mixing the class
+        # back in restores generation. It must come after the model class, per transformers.
+        extra_bases = () if isinstance(self.model, GenerationMixin) else (GenerationMixin,)
+        if extra_bases:
+            print(f"{base_cls.__name__} does not inherit GenerationMixin; mixing it in so "
+                  f"generate() works.")
+
+        class _AirLLMRuntimeModel(base_cls, *extra_bases):
+            @property
+            def device(self):
+                return running_device
+
+            @property
+            def dtype(self):
+                return running_dtype
+
+        self.model.__class__ = _AirLLMRuntimeModel
 
     def set_layers_from_layer_names(self):
-
         self.layers = []
 
         model_attr = self.model
@@ -249,7 +412,6 @@ class AirLLMBaseModel(GenerationMixin):
         model_attr = self.model
         for attr_name in self.layer_names_dict["layer_prefix"].split("."):
             model_attr = getattr(model_attr, attr_name)
-
         self.layers.extend(list(model_attr))
 
         model_attr = self.model
@@ -262,382 +424,497 @@ class AirLLMBaseModel(GenerationMixin):
             model_attr = getattr(model_attr, attr_name)
         self.layers.append(model_attr)
 
-    def load_rotary_pos_emb_to_device(self):
-        state_dict = load_layer(self.checkpoint_path, self.layer_names_dict['rotary_pos_emb'])
-        self.move_layer_to_device(state_dict)
+    # ---- weight streaming -------------------------------------------------------------------
 
     def load_layer_to_cpu(self, layer_name):
-
         t = time.time()
-
         load_layer_output = load_layer(self.checkpoint_path, layer_name, self.profiling_mode)
         elapsed_time = time.time() - t
 
         if self.profiling_mode:
             state_dict, compression_time = load_layer_output
             disk_loading_time = elapsed_time - compression_time
-
             self.profiler.add_profiling_time('load_safe_tensor', disk_loading_time)
-
             self.profiler.add_profiling_time('compression_time', compression_time)
         else:
             state_dict = load_layer_output
 
-        # pin memory:
-        if self.prefetching:
-            t = time.time()
-            if torch.cuda.is_available():  # Check if CUDA is available
-                for k in state_dict.keys():
-                    state_dict[k].pin_memory()
-            else:
-                # For CPU, no action is needed, but you could optionally add a log or message
-                print("Prefetching is enabled, but no pin_memory operation is needed for CPU.")
-
-            elapsed_time = time.time() - t
-            if self.profiling_mode:
-                self.profiler.add_profiling_time('pin_memory_to_trigger_load', elapsed_time)
+        if self.prefetching and torch.cuda.is_available():
+            # pin_memory() returns a pinned copy rather than pinning in place, so the result has to
+            # be kept for the faster host->device copy to actually happen. Pinned memory can't be
+            # paged out, so we only spend it on layers small enough to be safe: a frontier MoE
+            # checkpoint has ~17GB layers, and with prefetching two are in flight at once, which
+            # would lock up ~34GB of RAM for a copy that is dwarfed by the disk read anyway.
+            total_bytes = sum(v.numel() * v.element_size() for v in state_dict.values())
+            if total_bytes <= self.max_pinned_layer_bytes:
+                try:
+                    for k in state_dict.keys():
+                        state_dict[k] = state_dict[k].pin_memory()
+                except RuntimeError:
+                    # Out of pinned memory: fall back to pageable, which is slower but always works.
+                    pass
 
         return state_dict
 
-    def move_layer_to_device(self, state_dict):
-        layers = []
-        for param_name, param in state_dict.items():
-            if self.hf_quantizer is None:
-                layers.append(param_name)
+    def _restore_plain_weight_modules(self, state_dict):
+        """Undo CT's packed-parameter layout when the checkpoint still ships a plain ``weight``.
+
+        Some checkpoints (Kimi K3) list residual/router Linears under the MXFP4 target list but
+        store them as bf16. After ``preprocess_model`` those modules expose ``weight_packed`` and
+        reject the real ``weight`` tensor. Restore a meta ``weight`` Parameter so the shard can load.
+        """
+        plain = {k[:-len('.weight')] for k in state_dict if k.endswith('.weight')}
+        packed = {k[:-len('.weight_packed')] for k in state_dict if k.endswith('.weight_packed')}
+        for prefix in plain - packed:
+            try:
+                module = self.model.get_submodule(prefix)
+            except AttributeError:
+                continue
+            names = list(module._parameters.keys())
+            if 'weight' in names or 'weight_packed' not in names:
+                continue
+            weight = state_dict[f'{prefix}.weight']
+            for name in names:
+                if name == 'weight' or name.startswith('weight_'):
+                    module._parameters.pop(name, None)
+            module.register_parameter(
+                'weight',
+                torch.nn.Parameter(torch.empty(weight.shape, device='meta', dtype=weight.dtype),
+                                   requires_grad=False),
+            )
+            for attr in ('quantization_scheme', 'quantization_status', 'quantization_format'):
+                if hasattr(module, attr):
+                    delattr(module, attr)
+
+    def _decompress_state_dict(self, state_dict):
+        """Expand packed payloads into the plain weights the modules expect.
+
+        compressed-tensors has no quantized compute kernels: it registers a hook that decompresses
+        the whole model before the first forward, after which every quantized module wants a plain
+        ``weight``. Our shards still hold ``weight_packed``/``weight_scale``, so we expand them here.
+
+        The expansion happens on the GPU, after transferring the *packed* bytes. For MXFP4 that
+        moves 4x less data across PCIe than transferring an already-expanded weight would.
+        """
+        if self.hf_quantizer is None:
+            return state_dict
+
+        packed_prefixes = {k[: -len('.weight_packed')]
+                           for k in state_dict if k.endswith('.weight_packed')}
+        if not packed_prefixes:
+            return state_dict
+
+        from compressed_tensors.compressors.base import BaseCompressor
+        try:
+            from compressed_tensors.linear.compressed_linear import CompressedLinear
+        except ImportError:
+            CompressedLinear = None
+
+        out = dict(state_dict)
+        for prefix in packed_prefixes:
+            try:
+                module = self.model.get_submodule(prefix)
+            except AttributeError:
+                continue
+            # CompressedLinear's own forward consumes the packed payload, so leave it packed.
+            if CompressedLinear is not None and isinstance(module, CompressedLinear):
+                continue
+            scheme = getattr(module, 'quantization_scheme', None)
+            if scheme is None or getattr(scheme, 'format', None) is None:
+                continue
+
+            local = {k[len(prefix) + 1:]: v.to(self.running_device)
+                     for k, v in state_dict.items() if k.startswith(prefix + '.')}
+            # scheme.format is an enum on some compressed-tensors versions and a plain str on others.
+            fmt = getattr(scheme.format, 'value', scheme.format)
+            compressor = BaseCompressor.get_value_from_registry(fmt)
+            decompressed = compressor.decompress(local, scheme)
+
+            for k in local:
+                out.pop(f'{prefix}.{k}', None)
+            if 'weight' in decompressed:
+                # Once expanded, the module reads only `weight`; the scales that came back merely
+                # describe how the checkpoint stored it, and keeping them would waste VRAM.
+                out[f'{prefix}.weight'] = decompressed['weight']
+                self._expose_plain_weight(module, decompressed['weight'])
             else:
-                if '.weight' in param_name:
-                    layer_name = param_name[:param_name.index(".weight") + len(".weight")]
-                    if layer_name not in layers:
-                        layers.append(layer_name)
+                for k, v in decompressed.items():
+                    out[f'{prefix}.{k}'] = v
+        return out
 
-        for param_name in layers:
-            if (self.hf_quantizer is None or
-                not self.hf_quantizer.check_quantized_param(self.model, param_value=None, param_name=param_name, state_dict={})
-               ):
-                set_module_tensor_to_device(self.model, param_name, self.running_device, value=state_dict[param_name],
-                                            dtype=self.running_dtype,
-                                            )
-            else:
-                torch_dtype = self.hf_quantizer.update_torch_dtype(None)
-                self.hf_quantizer.create_quantized_param(self.model, state_dict[param_name], param_name, self.running_device, state_dict)
-        return layers
+    def _expose_plain_weight(self, module, weight):
+        """Swap a module's packed parameters for the plain ``weight`` its forward reads.
 
-    # make GenerationMixin happy
-    def can_generate(self):
-        return True
+        compressed-tensors patches a ``quantized_forward`` onto quantized Linears that reads
+        ``self.weight``; the packed parameters only describe how the checkpoint stores the value.
+        Marking the module COMPRESSED tells that forward the weight is already on the quantization
+        grid, so it skips a fake-quantize that would only reproduce what we just decompressed.
+        """
+        existing = module._parameters.get('weight')
+        if existing is None or existing.shape != weight.shape:
+            for name in [n for n in list(module._parameters) if n.startswith('weight')]:
+                module._parameters.pop(name, None)
+            module.register_parameter(
+                'weight',
+                torch.nn.Parameter(torch.empty(weight.shape, device='meta', dtype=weight.dtype),
+                                   requires_grad=False),
+            )
+        try:
+            from compressed_tensors.quantization import QuantizationStatus
+        except ImportError:
+            return
+        module.quantization_status = QuantizationStatus.COMPRESSED
 
-    def prepare_inputs_for_generation(
-            self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
-    ):
-        if past_key_values is not None:
-            past_length = self.get_past_key_values_cache_seq_len(past_key_values) #[0][0].shape[2]
+    def _adopt_checkpoint_shape(self, param_name, value):
+        """Resize a meta placeholder whose shape disagrees with the checkpoint.
 
-            # Some generation methods already pass only the last input ID
-            if input_ids.shape[1] > past_length:
-                remove_prefix_length = past_length
-            else:
-                # Default to old behavior: keep only final ID
-                remove_prefix_length = input_ids.shape[1] - 1
+        A model class builds its parameters from the config, and that construction can disagree
+        with the weights actually shipped. Kimi K3 sizes ``A_log`` from ``num_heads`` while its
+        checkpoint stores one entry per head channel, which would abort the load. For a parameter
+        still on meta -- i.e. one we have never materialised -- the checkpoint is the source of
+        truth, so adopt its shape.
+        """
+        module_path, _, attr = param_name.rpartition('.')
+        try:
+            module = self.model.get_submodule(module_path) if module_path else self.model
+        except AttributeError:
+            return
+        current = module._parameters.get(attr)
+        if current is None or current.device.type != 'meta' or current.shape == value.shape:
+            return
 
-            input_ids = input_ids[:, remove_prefix_length:]
+        if not hasattr(self, '_shape_adoption_warned'):
+            self._shape_adoption_warned = set()
+        if attr not in self._shape_adoption_warned:
+            self._shape_adoption_warned.add(attr)
+            print(f"{attr}: checkpoint ships {tuple(value.shape)} but the model class builds "
+                  f"{tuple(current.shape)}; using the checkpoint shape.")
 
-        position_ids = kwargs.get("position_ids", None)
-        if attention_mask is not None and position_ids is None:
-            # create position_ids on the fly for batch generation
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-            if past_key_values:
-                position_ids = position_ids[:, -input_ids.shape[1]:]
-
-        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if inputs_embeds is not None and past_key_values is None:
-            model_inputs = {"inputs_embeds": inputs_embeds}
-        else:
-            model_inputs = {"input_ids": input_ids}
-
-        model_inputs.update(
-            {
-                "position_ids": position_ids,
-                "past_key_values": past_key_values,
-                "use_cache": kwargs.get("use_cache"),
-                "attention_mask": attention_mask,
-            }
+        module.register_parameter(
+            attr,
+            torch.nn.Parameter(torch.empty(value.shape, device='meta', dtype=current.dtype),
+                               requires_grad=False),
         )
-        return model_inputs
+
+    def move_layer_to_device(self, state_dict):
+        self._restore_plain_weight_modules(state_dict)
+        state_dict = self._decompress_state_dict(state_dict)
+        marker = self.layer_names_dict.get('cpu_resident_marker')
+        moved = []
+        for param_name in self._param_names_from_state_dict(state_dict):
+            # A nested CPU table (Flash-Next PLE) must never be placed on the GPU, even if a
+            # decoder-layer shard still contains it.
+            if param_name in getattr(self, '_cpu_resident_params', ()):
+                continue
+            if marker and marker in param_name:
+                continue
+            if self.hf_quantizer is not None and self._needs_quantization(param_name):
+                # On-the-fly-quantizing schemes (e.g. bitsandbytes) reconstruct the param from the
+                # weight plus companion quant-state tensors carried in state_dict.
+                self.hf_quantizer.create_quantized_param(self.model, state_dict[param_name], param_name,
+                                                         self.running_device, state_dict)
+            else:
+                # Normal load. Only ordinary high-precision tensors get cast to the runtime dtype;
+                # pre-quantized payloads must be placed verbatim (see _should_load_verbatim).
+                value = state_dict[param_name]
+                self._adopt_checkpoint_shape(param_name, value)
+                if self._should_load_verbatim(param_name, value):
+                    set_module_tensor_to_device(self.model, param_name, self.running_device, value=value)
+                else:
+                    set_module_tensor_to_device(self.model, param_name, self.running_device,
+                                                value=value, dtype=self.running_dtype)
+            moved.append(param_name)
+        return moved
+
+    # Suffixes of the companion tensors that pre-quantized checkpoints ship alongside a weight
+    # (fp8 block scales, compressed-tensors/MXFP4 packed payloads and their scales, GPTQ indices).
+    _QUANT_COMPANION_SUFFIXES = ("_scale", "_scale_inv", "_packed", "_zero_point", "_g_idx", "_shape")
+
+    def _should_load_verbatim(self, param_name, value):
+        """Whether a checkpoint tensor must be placed on the device without a dtype cast.
+
+        Casting a pre-quantized payload to the runtime dtype destroys it: an fp8 weight loses its
+        quantization, and a 4-bit MXFP4 ``weight_packed`` tensor (stored as packed integers) becomes
+        meaningless floats. Equally important for very large models, decompressing on load would
+        multiply a layer's footprint by ~4x, which is what keeps Kimi-K3-class checkpoints from
+        fitting on a single GPU. So we keep anything that isn't a plain high-precision float as-is.
+        """
+        if not value.is_floating_point():
+            # Packed 4-bit payloads, zero points, g_idx, shape metadata.
+            return True
+        if value.element_size() == 1:
+            # Any 8-bit float: fp8 e4m3/e5m2 weights, and the e8m0 scales MXFP4 uses.
+            return True
+        return param_name.endswith(self._QUANT_COMPANION_SUFFIXES)
+
+    def _needs_quantization(self, param_name):
+        q = self.hf_quantizer
+        # transformers renamed check_quantized_param -> param_needs_quantization.
+        if hasattr(q, "param_needs_quantization"):
+            return q.param_needs_quantization(self.model, param_name)
+        return q.check_quantized_param(self.model, param_value=None, param_name=param_name, state_dict={})
+
+    def _param_names_from_state_dict(self, state_dict):
+        names = []
+        for param_name in state_dict.keys():
+            # bitsandbytes stores a weight plus companion quant-state tensors named
+            # "<weight>.4bit.*" / "<weight>.8bit.*"; those are reconstructed together via
+            # create_quantized_param, so collapse them down to the base weight name. Everything
+            # else (including fp8 weight + weight_scale_inv pairs) is kept as distinct params.
+            if '.4bit.' in param_name or '.8bit.' in param_name:
+                base = param_name.split('.4bit.')[0].split('.8bit.')[0]
+                if base not in names:
+                    names.append(base)
+            elif param_name not in names:
+                names.append(param_name)
+        return names
+
+    def _load_resident_modules(self):
+        """Load modules that sit outside the streamed embed -> layers -> norm -> lm_head sequence.
+
+        Multimodal checkpoints carry a vision tower and projector, and some architectures add
+        extra top-level norms. They never get a streaming hook, so without this they would stay on
+        the meta device and fail the moment they run. They are small (well under a GB), so we load
+        them once and leave them resident.
+        """
+        for name in self.layer_names_dict.get('resident', []):
+            try:
+                state_dict = self.load_layer_to_cpu(name)
+            except FileNotFoundError:
+                # Not every checkpoint of a given architecture ships every optional module.
+                continue
+            self.move_layer_to_device(state_dict)
+
+    def _cpu_resident_names(self):
+        """Module prefixes whose weights stay on CPU for the lifetime of the process.
+
+        Flash-Next's n-gram table is the motivating case: transformers already gathers rows onto
+        the embedding's own device, so keeping ~102GB of bf16 on the host is the designed path.
+        Names come from ``cpu_resident`` and from split files matching ``cpu_resident_marker``.
+        """
+        names = list(self.layer_names_dict.get('cpu_resident', []))
+        marker = self.layer_names_dict.get('cpu_resident_marker')
+        if marker:
+            for path in Path(self.checkpoint_path).glob('*.mmap.json'):
+                stem = path.name[:-len('.mmap.json')]
+                if stem.endswith(marker) and stem not in names:
+                    names.append(stem)
+            for path in Path(self.checkpoint_path).glob('*.safetensors'):
+                stem = path.name[:-len('.safetensors')]
+                if stem.endswith(marker) and stem not in names:
+                    names.append(stem)
+        return names
+
+    def _install_mmap_embedding(self, module_name, table):
+        parent_name, _, attr = module_name.rpartition('.')
+        parent = self.model.get_submodule(parent_name)
+        setattr(parent, attr, MmapEmbedding(table))
+
+    def _load_cpu_resident_modules(self):
+        """Load oversized lookup tables onto CPU and never stream them to the GPU.
+
+        Flash-Next's n-gram table is ~102GB bf16. We mmap it from disk so a 64GB host can still
+        run; transformers already gathers rows on ``ngram_embedding.weight.device``.
+        ``module.to('meta')`` after a decoder layer would otherwise evict a child embedding that
+        lives under that layer, so we also record the parameter names and evict selectively.
+        """
+        self._cpu_resident_params = set()
+        for name in self._cpu_resident_names():
+            mmap_meta = Path(self.checkpoint_path) / f"{name}.mmap.json"
+            if mmap_meta.exists():
+                table = open_ngram_mmap_table(self.checkpoint_path, name)
+                self._install_mmap_embedding(name, table)
+                self._cpu_resident_params.add(f"{name}.weight")
+                print(f"cpu-resident mmap embedding: {name} "
+                      f"{tuple(table.shape)} {table.dtype} (gathered from disk, not copied to RAM)")
+                continue
+            try:
+                state_dict = load_merged_ngram_embedding(self.checkpoint_path, name)
+            except FileNotFoundError:
+                continue
+            for param_name, value in state_dict.items():
+                self._adopt_checkpoint_shape(param_name, value)
+                if self._should_load_verbatim(param_name, value):
+                    set_module_tensor_to_device(self.model, param_name, 'cpu', value=value)
+                else:
+                    set_module_tensor_to_device(
+                        self.model, param_name, 'cpu', value=value, dtype=self.running_dtype)
+                self._cpu_resident_params.add(param_name)
+        if self._cpu_resident_params:
+            n = len(self._cpu_resident_params)
+            print(f"cpu-resident modules: left {n} tensors on host RAM "
+                  f"(n-gram / PLE table is gathered on CPU, not streamed to the GPU).")
+
+    def _install_streaming_hooks(self):
+        # Modules execute in this order during a forward: embed -> layers -> norm -> lm_head.
+        n = len(self.layer_names)
+
+        # Detect tied input/output embeddings. When tied, lm_head shares the embedding weight, so
+        # there is no separate lm_head shard. We keep the embedding resident on the GPU (it is the
+        # only copy and such models are small) and re-tie lm_head to it, then stream only the
+        # decoder layers and the final norm.
+        self.tie_word_embeddings = bool(getattr(self.config, "tie_word_embeddings", False))
+
+        if self.tie_word_embeddings:
+            embed_state = self.load_layer_to_cpu(self.layer_names[0])
+            self.move_layer_to_device(embed_state)
+            self.model.tie_weights()
+            self._streamed_indices = list(range(1, n - 1))  # decoder layers + final norm
+        else:
+            self._streamed_indices = list(range(n))
+
+        self._streamed_set = set(self._streamed_indices)
+
+        self._setup_expert_streaming()
+
+        for idx in self._streamed_indices:
+            module = self.layers[idx]
+            module._airllm_idx = idx
+            module.register_forward_pre_hook(self._pre_hook)
+            module.register_forward_hook(self._post_hook)
+
+    # ---- per-expert streaming ---------------------------------------------------------------
+
+    def _setup_expert_streaming(self):
+        """Stream individual MoE experts instead of whole decoder layers, where that is possible.
+
+        A sparse MoE layer holds hundreds of experts but routes each token to a handful of them.
+        Materialising the whole layer is therefore enormously wasteful: for Kimi K3 a layer's
+        experts are ~55GB expanded, of which a token touches ~1GB. Because the model calls each
+        selected expert as its own module (and skips unselected ones), a forward hook per expert
+        loads exactly the experts that actually run.
+
+        This needs `expert_prefix` in layer_names_dict and safetensors shards, since it relies on
+        reading individual tensors out of a shard.
+        """
+        self._expert_streaming = False
+        self._expert_keys = {}
+        self._non_expert_keys = {}
+
+        expert_prefix = self.layer_names_dict.get('expert_prefix')
+        if not expert_prefix:
+            return
+        if type(ModelPersister.get_model_persister()).__name__ != 'SafetensorModelPersister':
+            return
+
+        layer_prefix = self.layer_names_dict['layer_prefix']
+        hooked = 0
+
+        for idx in self._streamed_indices:
+            layer_name = self.layer_names[idx]
+            if not layer_name.startswith(layer_prefix + '.'):
+                continue
+            try:
+                names = layer_tensor_names(self.checkpoint_path, layer_name)
+            except Exception:
+                continue
+
+            marker = f'.{expert_prefix}.'
+            per_expert = {}
+            others = []
+            for key in names:
+                pos = key.find(marker)
+                if pos == -1:
+                    others.append(key)
+                    continue
+                rest = key[pos + len(marker):]
+                head = rest.split('.', 1)[0]
+                if not head.isdigit():
+                    others.append(key)
+                    continue
+                per_expert.setdefault(int(head), []).append(key)
+
+            if not per_expert:
+                continue
+
+            layer_module = self.layers[idx]
+            experts_container = layer_module
+            try:
+                for attr in expert_prefix.split('.'):
+                    experts_container = getattr(experts_container, attr)
+            except AttributeError:
+                continue
+
+            self._non_expert_keys[idx] = others
+            self._expert_keys[idx] = per_expert
+
+            for expert_idx, keys in per_expert.items():
+                if expert_idx >= len(experts_container):
+                    continue
+                expert_module = experts_container[expert_idx]
+                expert_module._airllm_expert = (idx, expert_idx)
+                expert_module.register_forward_pre_hook(self._expert_pre_hook)
+                expert_module.register_forward_hook(self._expert_post_hook)
+                hooked += 1
+
+        if hooked:
+            self._expert_streaming = True
+            n_layers = len(self._expert_keys)
+            print(f"per-expert streaming enabled: {hooked} experts across {n_layers} layers "
+                  f"load on demand, so only the experts a token routes to are materialised.")
+
+    def _expert_pre_hook(self, module, args):
+        layer_idx, expert_idx = module._airllm_expert
+        keys = self._expert_keys[layer_idx][expert_idx]
+        state_dict = load_layer_subset(self.checkpoint_path, self.layer_names[layer_idx], keys)
+        module._airllm_moved = self.move_layer_to_device(state_dict)
+
+    def _expert_post_hook(self, module, args, output):
+        for param_name in getattr(module, '_airllm_moved', []):
+            set_module_tensor_to_device(self.model, param_name, 'meta')
+        module._airllm_moved = []
+        return output
+
+    def _next_streamed_idx(self, idx):
+        nxt = idx + 1
+        return nxt if nxt in self._streamed_set else None
+
+    def _load_streamed_layer(self, idx):
+        """Load one streamed module's weights. Experts are excluded when they stream themselves."""
+        keys = self._non_expert_keys.get(idx) if getattr(self, '_expert_streaming', False) else None
+        if keys is None:
+            return self.load_layer_to_cpu(self.layer_names[idx])
+        return load_layer_subset(self.checkpoint_path, self.layer_names[idx], keys)
+
+    def _pre_hook(self, module, args):
+        idx = module._airllm_idx
+
+        if self.prefetching and self._prefetch_future is not None and self._prefetched_idx == idx:
+            state_dict = self._prefetch_future.result()
+            self._prefetch_future = None
+        else:
+            state_dict = self._load_streamed_layer(idx)
+
+        module._airllm_moved = self.move_layer_to_device(state_dict)
+
+        if self.prefetching:
+            nxt = self._next_streamed_idx(idx)
+            if nxt is not None:
+                self._prefetch_future = self._executor.submit(self._load_streamed_layer, nxt)
+                self._prefetched_idx = nxt
+
+    def _post_hook(self, module, args, output):
+        # module.to('meta') would also evict experts (which manage their own lifetime) and any
+        # cpu-resident child such as Flash-Next's n-gram table, which lives under a decoder layer
+        # but must stay materialised on the host. When any of those are in play, only release the
+        # tensors this hook actually placed.
+        if (self.hf_quantizer is not None
+                or getattr(self, '_expert_streaming', False)
+                or getattr(self, '_cpu_resident_params', None)):
+            for param_name in getattr(module, '_airllm_moved', []):
+                set_module_tensor_to_device(self.model, param_name, 'meta')
+        else:
+            module.to('meta')
+        clean_memory()
+        return output
+
+    # ---- delegation to the underlying transformers model ------------------------------------
+
+    def generate(self, *args, **kwargs):
+        return self.model.generate(*args, **kwargs)
+
+    def forward(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
 
     def __call__(self, *args, **kwargs):
-        return self.forward(*args, **kwargs)
-
-    def get_past_key_values_cache_seq_len(self, past_key_values):
-        return past_key_values[0][0].shape[2]
-    def get_sequence_len(self, seq):
-        return seq.shape[1]
-
-    def get_pos_emb_args(self, len_p, len_s):
-        return {}
-
-    def get_past_key_value_args(self, k_cache, v_cache):
-        return {'past_key_value': (k_cache, v_cache)}
-
-    def get_attention_mask_args(self, full_attention_mask, len_p, len_s):
-        return {'attention_mask': full_attention_mask[:, :, -len_s:, -len_p - len_s:]}
-
-    def get_position_ids_args(self, full_position_ids, len_p, len_s):
-
-        return {'position_ids': full_position_ids[:, len_p:len_p + len_s]}
-
-
-    def run_lm_head(self, layer, seq):
-        return layer(seq).float()
-
-    def run_norm(self, layer, seq):
-        return layer(seq)
-
-    def forward(
-            self,
-            input_ids: torch.LongTensor = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_values: Optional[List[torch.FloatTensor]] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            labels: Optional[torch.LongTensor] = None,
-            use_cache: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
-
-        if cache_utils_installed:
-            # we don't support kv cache for new version yet
-            use_cache = False
-
-        if self.profiling_mode:
-            self.profiler.clear_profiling_time()
-
-            forward_start = time.process_time()
-            forward_start_wall = time.time()
-
-        # Reboot the model to make sure buffers are loaded and memory is clean
-        del self.model
-        clean_memory()
-        self.init_model()
-
-        batch = [input_ids_unit.to(self.running_device).unsqueeze(0) for input_ids_unit in input_ids]
-        n_seq = len(batch[0])
-
-        # Create attention mask for the largest input, and position ids to use KV cache
-        attention_mask = torch.ones(self.max_seq_len, self.max_seq_len)
-        attention_mask = attention_mask.triu(diagonal=1)[None, None, ...] == 0
-        attention_mask = attention_mask.to(self.running_device)
-        position_ids = torch.arange(self.max_seq_len, dtype=torch.long, device=self.running_device)[None, :]
-
-        kv_cache_list = [] if use_cache else None
-        if use_cache:
-            for x in self.layers:
-                kv_cache_list.append(([], []))
-        all_hidden_states = [] * len(self.layers) if output_hidden_states else None
-        all_self_attns = [] * len(self.layers) if output_attentions else None
-
-        with torch.inference_mode(), ThreadPoolExecutor() as executor:
-
-            # Load first layer
-            if self.prefetching:
-                #with torch.cuda.stream(self.stream):
-                #state_dict = self.load_layer_to_cpu(self.layer_names[0])
-                future = executor.submit(self.load_layer_to_cpu, self.layer_names[0])
-
-
-            for i, (layer_name, layer) in tqdm(enumerate(zip(self.layer_names, self.layers)),
-                                               desc=f'running layers({self.running_device})',
-                                               total=len(self.layers)):
-
-                if self.prefetching:
-                    if self.profiling_mode:
-                        t = time.time()
-                    # Load current layer and prepare next layer
-                    state_dict = future.result()
-                    #torch.cuda.current_stream().wait_stream(self.stream)
-                    if self.profiling_mode:
-                        elapsed_time = time.time() - t
-                        self.profiler.add_profiling_time('load_safe_tensor_cpu_wait', elapsed_time)
-
-                    #for param_name, param in state_dict.items():
-                    #    state_dict[param_name] = param.to('cuda', non_blocking=True)
-
-                    if self.profiling_mode:
-                        t = time.time()
-                    moved_layers = self.move_layer_to_device(state_dict)
-                    if self.profiling_mode:
-                        elapsed_time = time.time() - t
-                        self.profiler.add_profiling_time('create_layer_from_state_dict', elapsed_time)
-
-                    # kick off next layer loading
-
-                    if (i + 1) < len(self.layer_names):
-                        #with torch.cuda.stream(self.stream):
-                        #state_dict = self.load_layer_to_cpu(self.layer_names[i + 1])
-                        if self.profiling_mode:
-                            t = time.time()
-                        future = executor.submit(self.load_layer_to_cpu, self.layer_names[i+1])
-                        #for param_name, param in state_dict.items():
-                        #    state_dict[param_name] = param.to('cuda', non_blocking=True)
-
-                        if self.profiling_mode:
-                            elapsed_time = time.time() - t
-                            self.profiler.add_profiling_time('kick_off_load_cpu', elapsed_time)
-
-                else:
-                    state_dict = self.load_layer_to_cpu(layer_name)
-                    if self.profiling_mode:
-                        t = time.time()
-                    moved_layers = self.move_layer_to_device(state_dict)
-                    if self.profiling_mode:
-                        elapsed_time = time.time() - t
-                        self.profiler.add_profiling_time('create_layer_from_safe_tensor', elapsed_time)
-
-                # Run layer
-
-                for j, seq in enumerate(batch):
-
-                    if layer_name == self.layer_names_dict['embed']:
-                        batch[j] = layer(seq)
-                    elif layer_name == self.layer_names_dict['norm']:
-                        #batch[j] = layer(seq[torch.arange(n_seq), batch_eos[j]][:, None])
-                        batch[j] = self.run_norm(layer, seq)
-
-                        if output_attentions:
-                            all_hidden_states[i].append(batch[j])
-                    elif layer_name == self.layer_names_dict['lm_head']:
-                        batch[j] = self.run_lm_head(layer, seq)
-                    else:
-
-                        if output_attentions:
-                            all_hidden_states[i].append(new_seq)
-
-                        if past_key_values is not None:
-                            # join past kv
-                            k_cache, v_cache = past_key_values[i - 1]
-                            len_p = self.get_past_key_values_cache_seq_len(past_key_values)
-                            len_s = self.get_sequence_len(seq)
-
-                            position_ids_args = self.get_position_ids_args(position_ids, len_p, len_s)
-                            attention_mask_args = self.get_attention_mask_args(attention_mask, len_p, len_s)
-                            past_key_value_args = self.get_past_key_value_args(k_cache, v_cache)
-
-                            kwargs = {'use_cache':True,
-                                      }
-
-                            pos_embed_args = self.get_pos_emb_args(len_p, len_s)
-                            kwargs = {**kwargs, **past_key_value_args, **pos_embed_args, **attention_mask_args,
-                                      **position_ids_args}
-
-
-                            layer_outputs = layer(seq,
-                                                  **kwargs
-                                                  )
-                            new_seq = layer_outputs[0]
-
-                            if output_attentions:
-                                all_self_attns[i].append(layer_outputs[1])
-
-                            if use_cache:
-                                (k_cache, v_cache) = layer_outputs[2 if output_attentions else 1]
-                                kv_cache_list[i][0].append(k_cache)
-                                kv_cache_list[i][1].append(v_cache)
-
-
-                        else:
-                            len_seq = self.get_sequence_len(seq)
-
-
-
-                            pos_embed_args = self.get_pos_emb_args(0, len_seq)
-                            attention_mask_args = self.get_attention_mask_args(attention_mask, 0, len_seq)
-                            position_ids_args = self.get_position_ids_args(position_ids, 0, len_seq)
-
-
-
-
-                            if not use_cache:
-
-                                kwargs = {'use_cache': False,
-                                          'attention_mask': attention_mask[:, :, -len_seq:, -len_seq:],
-                                          }
-                                kwargs = {**kwargs, **pos_embed_args, **attention_mask_args, **position_ids_args}
-
-
-                                new_seq = layer(seq, **kwargs)[0]
-                            else:
-
-                                kwargs = {'use_cache': True,
-                                          'attention_mask': attention_mask[:, :, -len_seq:, -len_seq:],
-                                          }
-                                kwargs = {**kwargs, **pos_embed_args, **attention_mask_args, **position_ids_args}
-
-                                layer_out = layer(seq, **kwargs)
-
-                                # TODO: adopt Cache mechanism in 4.36
-                                new_seq, (k_cache, v_cache) = layer_out
-                                kv_cache_list[i][0].append(k_cache)
-                                kv_cache_list[i][1].append(v_cache)
-
-                                # print(f"k_cache sizes: {[len(x[1]) for x in kv_cache_list]}")
-
-                        batch[j] = new_seq
-
-                if output_hidden_states:
-                    all_hidden_states += (torch.cat(batch, 0),)
-
-                # Remove previous layer from memory (including buffers)
-
-                if self.hf_quantizer is not None:
-                    for param_name in moved_layers:#param_name, param in state_dict.items():
-                        set_module_tensor_to_device(self.model, param_name,'meta')
-                else:
-                    layer.to("meta")
-
-                layer.to("meta")
-                clean_memory()  # proposed by CPMP
-
-        logits = torch.cat(batch, 0)
-        if use_cache:
-            kv_cache_list = kv_cache_list[1:-2]
-            for i in range(len(kv_cache_list)):
-                # print(f"{i} - {kv_cache_list[i][0].shape}")
-                kv_cache_list[i] = (torch.cat(kv_cache_list[i][0], 0), torch.cat(kv_cache_list[i][1], 0))
-            #print(f"returning kvcache size: {kv_cache_list[0][0].shape}")
-
-        if output_attentions:
-            all_self_attns = all_self_attns[0:-2]
-            for i in range(len(all_self_attns)):
-                all_self_attns[i] = torch.cat(all_self_attns[i], 0)
-
-        if output_hidden_states:
-            all_hidden_states = all_hidden_states[0:-2]
-            for i in range(len(all_hidden_states)):
-                all_hidden_states[i] = torch.cat(all_hidden_states[i], 0)
-
-        if not return_dict:
-            return tuple(v for v in [logits,
-                                     tuple(kv_cache_list) if kv_cache_list is not None else None,
-                                     tuple(all_hidden_states) if all_hidden_states is not None else None,
-                                     tuple(all_self_attns) if all_self_attns is not None else None] if v is not None)
-        if self.profiling_mode:
-            forward_elapsed_time = time.process_time() - forward_start
-            forward_elapsed_time_wall = time.time() - forward_start_wall
-            self.profiler.print_profiling_time()
-
-
-            print(f"total infer process time(including all above plus gpu compute): {forward_elapsed_time:.04f}")
-            print(f"total infer wall time(including all above plus gpu compute): {forward_elapsed_time_wall:.04f}")
-
-            self.profiler.clear_profiling_time()
-
-
-        return CausalLMOutputWithPast(
-            loss=None,
-            logits=logits,
-            past_key_values=tuple(kv_cache_list) if kv_cache_list is not None else None,
-            hidden_states=tuple(all_hidden_states) if all_hidden_states is not None else None,
-            attentions=tuple(all_self_attns) if all_hidden_states is not None else None,
-        )
+        return self.model(*args, **kwargs)

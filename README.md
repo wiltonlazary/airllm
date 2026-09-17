@@ -6,7 +6,7 @@
 [**Example notebooks**](#example-python-notebook) | 
 [**FAQ**](#faq)
 
-**AirLLM** optimizes inference memory usage, allowing 70B large language models to run inference on a single 4GB GPU card without quantization, distillation and pruning. And you can run **405B Llama3.1** on **8GB vram** now.
+**AirLLM** dramatically reduces inference memory usage, letting 70B large language models run on a single 4GB GPU card — without quantization, distillation, or pruning. You can even run **Kimi K3 (2.8T)** — the largest open-source model released to date — on **under 4GB**, **Qwen3.8-Flash-Next (125B)** on **6GB**, and **DeepSeek-V3 (671B)** on **~12GB**. We now also support training huge models on small VRAM: **Qwen3.8-Flash-Next (125B)** under **6GB**.
 
 <a href="https://github.com/lyogavin/airllm/stargazers">![GitHub Repo stars](https://img.shields.io/github/stars/lyogavin/airllm?style=social)</a>
 [![Downloads](https://static.pepy.tech/personalized-badge/airllm?period=total&units=international_system&left_color=grey&right_color=blue&left_text=downloads)](https://pepy.tech/project/airllm)
@@ -29,6 +29,16 @@
 * [Best AI Facial Expression Editor](https://crazyfaceai.com)
 
 ## Updates
+[2026/09] **Training** support: stream frozen weights one layer at a time and keep adapters on the GPU. **Qwen3.8-Flash-Next (125B)** trains under **6GB** (RTX 3060 Ti); **Qwen3.8-27B** trains in **~2GB** at seq 512. See [Training](#training).
+
+[2026/08] **Qwen3.8-Flash-Next** support: Qwen's 125B MoE flagship (`Qwen4ExpForConditionalGeneration`) with a ~51B n-gram embedding runs in **5.95GB** of VRAM, measured end to end on one RTX 4090. The n-gram table is file-mapped on the host (a 64GB machine is enough); decoder layers stream. Needs a `transformers` build with in-tree `qwen4_exp` (`pip install git+https://github.com/huggingface/transformers.git` today) and ~360GB of checkpoint disk (`delete_original=True` reclaims the originals after the split).
+
+[2026/08] **Qwen3.8-27B** support: Qwen's new dense VL (Gated DeltaNet + Gated Attention, native vision) runs in **3.33GB** of VRAM, measured end to end on one RTX 3090. Needs `transformers` 5.8+.
+
+[2026/07] **Kimi K3 (2.8T)** support: the largest open-source model runs on a single card in **3.72GB** of VRAM, measured end to end on one RTX 6000 Ada. Per-expert streaming loads only the experts a token actually routes to. K3 brings three requirements of its own: `pip install compressed-tensors flash-attn` (its model code mandates flash attention regardless of what you request), a CUDA 12 build of torch, since no prebuilt flash-attn wheel exists for CUDA 13 yet, and `transformers` 4.56.x, as its remote code does not load on 5.x.
+
+[2026/06] **v3.0**: FP8 model support + the latest models. Run **DeepSeek-V3 (671B) on ~12GB** and **Qwen3-235B on ~3GB**, plus Qwen3, Llama 3.x/4, DeepSeek V2/V3, Phi-4, Gemma and more — all through a single `AutoModel`.
+
 [2024/08/20] v2.11.0: Support Qwen2.5
 
 [2024/08/18] v2.10.1 Support CPU inference. Support non sharded models. Thanks @NavodPeiris for the great work! 
@@ -55,7 +65,12 @@
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=lyogavin/airllm&type=Timeline)](https://star-history.com/#lyogavin/airllm&Timeline)
+<a href="https://star-history.com/#lyogavin/airllm&Timeline">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/star-history-dark.png">
+    <img alt="Star History Chart" src="assets/star-history.png">
+  </picture>
+</a>
 
 ## Table of Contents
 
@@ -65,6 +80,7 @@
 * [Run on MacOS](#macos)
 * [Example notebooks](#example-python-notebook)
 * [Supported Models](#supported-models)
+* [Training](#training)
 * [Acknowledgement](#acknowledgement)
 * [FAQ](#faq)
 
@@ -88,11 +104,17 @@ Then, initialize AirLLMLlama2, pass in the huggingface repo ID of the model bein
 from airllm import AutoModel
 
 MAX_LENGTH = 128
-# could use hugging face model repo id:
-model = AutoModel.from_pretrained("garage-bAInd/Platypus2-70B-instruct")
+# just pass a hugging face repo id — works with almost any popular model:
+model = AutoModel.from_pretrained("Qwen/Qwen3-32B")
 
-# or use model's local path...
-#model = AutoModel.from_pretrained("/home/ubuntu/.cache/huggingface/hub/models--garage-bAInd--Platypus2-70B-instruct/snapshots/b585e74bcaae02e52665d9ac6d23f4d0dbc81a0f")
+# go bigger with the exact same one line:
+#model = AutoModel.from_pretrained("Qwen/Qwen3.8-27B")          # 27B dense VL, 3.33GB
+#model = AutoModel.from_pretrained("Qwen/Qwen3.8-Flash-Next")    # 125B MoE + 51B PLE, 5.95GB
+#model = AutoModel.from_pretrained("Qwen/Qwen3-235B-A22B")     # 235B, runs in ~3GB
+#model = AutoModel.from_pretrained("deepseek-ai/DeepSeek-V3")  # 671B, runs in ~12GB
+
+# or use a model's local path...
+#model = AutoModel.from_pretrained("/home/ubuntu/.cache/huggingface/hub/models--Qwen--Qwen3-32B/snapshots/...")
 
 input_text = [
         'What is the capital of United States?',
@@ -252,6 +274,109 @@ model.tokenizer.decode(generation_output.sequences[0])
 #### To request other model support: [here](https://docs.google.com/forms/d/e/1FAIpQLSe0Io9ANMT964Zi-OQOq1TJmnvP-G3_ZgQDhP7SatN0IEdbOg/viewform?usp=sf_link)
 
 
+
+## Supported Models
+
+AirLLM works out of the box with **virtually every popular open LLM** — just pass its Hugging Face ID to `AutoModel.from_pretrained(...)`. That covers all the major families:
+
+**Llama** (2 / 3 / 3.1 / 3.3 / 4) · **Qwen** (1 / 2 / 2.5 / 3 / 3.5 / 3.8, including MoE, Flash-Next, FP8, and native VL) · **DeepSeek** (V2 / V3 / R1) · **Mistral & Mixtral** · **Phi** · **Gemma** · **ChatGLM** · **Baichuan** · **InternLM** · **Yi** · **Kimi K3** — and most new models the day they're released.
+
+### Tiny GPU, huge models
+
+The trick: AirLLM only ever keeps **one layer on the GPU at a time**, so the VRAM you need depends on the model's layer size — not its total size. That's how a 671B model fits on a hobbyist card:
+
+| Model | Size | GPU VRAM |
+|---|---|---|
+| Qwen3 / Mistral / Phi (≈8B) | 8B | **~1–2 GB** |
+| Qwen3-30B / Mixtral (MoE) | 30–47B | **~1–3 GB** |
+| Qwen3.8-27B (dense VL) | 27B | **3.33 GB** |
+| Qwen3.8-Flash-Next (MoE + PLE) | ~180B | **5.95 GB** |
+| Qwen3-235B (MoE) | 235B | **~3 GB** |
+| Llama 3.x 70B (full precision) | 70B | **~4 GB** |
+| Llama 3.1 405B | 405B | **~8 GB** |
+| DeepSeek-V3 | **671B** | **~12 GB** |
+
+Same one line of code for all of them — no special setup.
+
+## Training
+
+AirLLM can fine-tune huge models on a small GPU. Frozen base weights stream from disk one decoder layer at a time; only the adapters stay resident. **Qwen3.8-Flash-Next (125B)** trains under **6GB**; **Qwen3.8-27B** trains in **~2GB** at seq 512.
+
+This is not Hugging Face Trainer / bitsandbytes QLoRA. Flash-Next needs a `transformers` build with in-tree `qwen4_exp` (`pip install git+https://github.com/huggingface/transformers.git` today).
+
+### 1. Prepare a dataset
+
+One JSON object per line (`.jsonl`). The usual field is `text` — next-token prediction over the whole string:
+
+```json
+{"text": "Your first training document. Can be a few sentences or a few paragraphs."}
+{"text": "Your second training document."}
+```
+
+Instruction pairs work too. Loss is applied on the completion only:
+
+```json
+{"prompt": "What is AirLLM?", "completion": "A library that runs and trains huge models on small VRAM."}
+{"instruction": "Translate to English", "input": "bonjour", "output": "hello"}
+```
+
+A `.txt` file is also fine: one example per blank-line-separated block. A two-line starter file lives at `air_llm/examples/sft_example.jsonl`.
+
+### 2. Run training
+
+From the repo root, point `--data` at your file:
+
+```bash
+python air_llm/examples/train_qwen38_flash_next_lora.py \
+  --data my_data.jsonl \
+  --seq-len 512 \
+  --epochs 1 \
+  --save-adapter qwen38-flash-next-lora.pt
+```
+
+For the 27B dense model:
+
+```bash
+python air_llm/examples/train_qwen38_lora.py \
+  --data my_data.jsonl \
+  --seq-len 512 \
+  --epochs 1 \
+  --save-adapter qwen38-27b-lora.pt
+```
+
+`--steps N` stops after N examples (useful for a smoke test). Omit `--data` and the script overfits a built-in snippet.
+
+### Python API
+
+```python
+from airllm import AirLLMLoRAQwen4Exp
+
+trainer = AirLLMLoRAQwen4Exp(
+    "Qwen/Qwen3.8-Flash-Next",
+    max_seq_len=512,
+    lora_r=16,
+    delete_original=True,
+)
+
+tok = trainer.tokenizer
+if tok.pad_token_id is None:
+    tok.pad_token = tok.eos_token
+
+encoded = tok(
+    "Your training text here.",
+    return_tensors="pt",
+    truncation=True,
+    max_length=512,
+)
+loss = trainer.train_step(
+    encoded["input_ids"].cuda(),
+    attention_mask=encoded.get("attention_mask"),
+)
+print(loss)
+trainer.save_adapter("qwen38-flash-next-lora.pt")
+```
+
+`AirLLMLoRA` is the same API for `Qwen/Qwen3.8-27B`.
 
 ## Acknowledgement
 
